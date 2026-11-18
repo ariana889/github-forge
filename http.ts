@@ -64,14 +64,14 @@ const EMPTY_BODY = Buffer.alloc(0);
 
 /**
  * Read a whole request body; null when it is past `limit` bytes. The usual case is one buffered
- * chunk, which is answered without an array, a concat or an async iterator; the socket is dropped
- * when the body is over the limit, as an unread body would otherwise poison the keep-alive socket.
+ * chunk, which is answered without an array, a concat or an async iterator. A body past the limit
+ * is read to its end and dropped, so the answer still leaves a usable keep-alive socket.
  */
 export async function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer | null> {
   const first = req.read();
   if (first !== null) {
     if (first.length > limit) {
-      req.destroy();
+      restOf(req, 0);
       return null;
     }
     const rest = await restOf(req, limit - first.length);
@@ -86,15 +86,13 @@ function restOf(req: IncomingMessage, remaining: number): Promise<Buffer | null>
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    let over = false;
+    let over = remaining === 0;
     const onData = (chunk: Buffer): void => {
       if (over) return;
       size += chunk.length;
       if (size > remaining) {
         over = true;
         chunks.length = 0;
-        req.destroy();
-        resolve(null);
         return;
       }
       chunks.push(chunk);
