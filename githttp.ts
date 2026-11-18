@@ -96,14 +96,19 @@ function wantsV2(req) {
   return typeof text === 'string' && /version\s*=\s*2/.test(text);
 }
 
+/** The v2 advertisement body, built once: its capabilities never change. */
+let v2AdvertBody = null;
+
 /** The ref advertisement: v2 capabilities for upload-pack, a v0 ref list otherwise. */
 function advertise(req, res, repo, service, v2) {
-  const preamble = pktLine(`# service=${service}\n`);
   if (v2) {
-    const body = Buffer.concat([preamble, pktFlush(), encodePktLines([...v2CapabilityLines(), 'flush'])]);
-    sendBytes(res, 200, UPLOAD_ADVERT, body);
+    if (v2AdvertBody === null) {
+      v2AdvertBody = Buffer.concat([pktLine(`# service=${service}\n`), pktFlush(), encodePktLines([...v2CapabilityLines(), 'flush'])]);
+    }
+    sendBytes(res, 200, UPLOAD_ADVERT, v2AdvertBody);
     return;
   }
+  const preamble = pktLine(`# service=${service}\n`);
   const caps = service === 'git-receive-pack' ? RECEIVE_V0_CAPS : UPLOAD_V0_CAPS;
   const body = Buffer.concat([preamble, pktFlush(), encodePktLines([...v0AdvertLines(repo, caps), 'flush'])]);
   sendBytes(res, 200, service === 'git-receive-pack' ? RECEIVE_ADVERT : UPLOAD_ADVERT, body);
@@ -272,14 +277,53 @@ function fetchObjects(repo, wants, haves, depth, clientShallow) {
 /** The pack for one fetch, cached: the shallow-clone workload asks fifty times for the same one. */
 const packCache = new Map();
 
+/**
+ * The plan for one fetch (which objects to send, which shallow boundaries moved), memoized: fifty
+ * concurrent shallow clones ask the identical question, and the answer is a pure function of the
+ * repository's immutable object graph plus the request's wants, haves and depth.
+ */
+const planCache = new Map();
+
+function fetchPlan(repo, wants, haves, depth, clientShallow) {
+  const key = `${repo.id}|${repo.objects.size}|${depth === null ? 'full' : depth}|${wants.join(',')}|${haves.join(',')}|${[...clientShallow].sort().join(',')}`;
+  const cached = planCache.get(key);
+  if (cached !== undefined) return cached;
+  const plan = fetchObjects(repo, wants, haves, depth, clientShallow);
+  if (planCache.size > 500) planCache.clear();
+  planCache.set(key, plan);
+  return plan;
+}
+
 function packFor(repo, objects) {
-  const key = `${repo.id}:${objects.map((object) => object.oid).join(',')}`;
+  const key = `${repo.id}:${objects.length}:${objects.map((object) => object.oid).join(',')}`;
   const cached = packCache.get(key);
   if (cached !== undefined) return cached;
   const pack = writePack(objects);
   if (packCache.size > 200) packCache.clear();
   packCache.set(key, pack);
   return pack;
+}
+
+/**
+ * The whole v2 fetch response body for one plan: the moved shallow boundaries, then the packfile
+ * section. It is a pure function of the plan, so it is built once and handed to every client that
+ * asks the same question.
+ */
+function fetchResponse(repo, plan) {
+  if (plan.response !== undefined) return plan.response;
+  const parts = [];
+  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
+    const lines = [];
+    for (const oid of plan.shallow) lines.push(`shallow ${oid}\n`);
+    for (const oid of plan.unshallow) lines.push(`unshallow ${oid}\n`);
+    parts.push(encodePktLines(['shallow-info\n', ...lines, 'flush']));
+  }
+  const pack = packFor(repo, plan.objects);
+  parts.push(encodePktLines(['packfile\n']));
+  parts.push(Buffer.concat(sidebandFrames(1, pack)));
+  parts.push(pktFlush());
+  plan.response = Buffer.concat(parts);
+  return plan.response;
 }
 
 // ---------------------------------------------------------------- v2 fetch
@@ -328,18 +372,8 @@ function fetchV2(repo, args, res) {
     sendBytes(res, 200, UPLOAD_RESULT, encodePktLines(['acknowledgments\n', ...lines, 'flush']));
     return;
   }
-  const computed = fetchObjects(repo, wants, haves, depth, clientShallow);
-  if (computed.shallow.length > 0 || computed.unshallow.length > 0) {
-    const lines = [];
-    for (const oid of computed.shallow) lines.push(`shallow ${oid}\n`);
-    for (const oid of computed.unshallow) lines.push(`unshallow ${oid}\n`);
-    parts.push(encodePktLines(['shallow-info\n', ...lines, 'flush']));
-  }
-  const pack = packFor(repo, computed.objects);
-  parts.push(encodePktLines(['packfile\n']));
-  parts.push(Buffer.concat(sidebandFrames(1, pack)));
-  parts.push(pktFlush());
-  sendBytes(res, 200, UPLOAD_RESULT, Buffer.concat(parts));
+  const plan = fetchPlan(repo, wants, haves, depth, clientShallow);
+  sendBytes(res, 200, UPLOAD_RESULT, fetchResponse(repo, plan));
 }
 
 // ---------------------------------------------------------------- v0 fetch
@@ -464,7 +498,6 @@ function applyCommands(repo, commands) {
     repo.refs.set(command.ref, command.newOid);
     results.push({ ref: command.ref, ok: true });
   }
-  repo.ancestorCache.clear();
   return results;
 }
 
@@ -484,7 +517,6 @@ function receivePack(repo, body, res) {
     try {
       const read = readPack(packBytes, (oid) => repo.objects.get(oid) ?? null);
       for (const object of read.objects) putObject(repo, object.type, object.data);
-      repo.ancestorCache.clear();
     } catch (error) {
       unpackDetail = `error ${String(error.message).replace(/\s+/g, ' ').slice(0, 200)}`;
     }

@@ -168,19 +168,28 @@ export function peel(repo, oid) {
 
 // ---------------------------------------------------------------- ancestry
 
-/** Every commit reachable from `tip` (the tip included). */
+/**
+ * Every commit reachable from `tip` (the tip included). A commit's ancestry never changes, so the
+ * sets are cached for the life of the process and a new tip costs one step over its parent's set:
+ * the push workload's 200 sequential commits do not walk the history again per push.
+ */
 export function ancestorsOf(repo, tip) {
   const cached = repo.ancestorCache.get(tip);
   if (cached !== undefined) return cached;
   const seen = new Set();
-  const queue = [tip];
-  while (queue.length > 0) {
-    const oid = queue.pop();
+  const stack = [tip];
+  while (stack.length > 0) {
+    const oid = stack.pop();
     if (seen.has(oid)) continue;
+    const known = repo.ancestorCache.get(oid);
+    if (known !== undefined) {
+      for (const oid2 of known) seen.add(oid2);
+      continue;
+    }
     seen.add(oid);
     const commit = getCommit(repo, oid);
     if (commit === null) continue;
-    for (const parent of commit.parents) if (!seen.has(parent)) queue.push(parent);
+    for (const parent of commit.parents) if (!seen.has(parent)) stack.push(parent);
   }
   repo.ancestorCache.set(tip, seen);
   return seen;
@@ -189,6 +198,8 @@ export function ancestorsOf(repo, tip) {
 /** Whether `ancestor` is `descendant` or one of its ancestors: the fast-forward test. */
 export function isAncestor(repo, ancestor, descendant) {
   if (ancestor === descendant) return true;
+  const commit = getCommit(repo, descendant);
+  if (commit !== null && commit.parents.includes(ancestor)) return true;
   return ancestorsOf(repo, descendant).has(ancestor);
 }
 
