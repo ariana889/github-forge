@@ -23,6 +23,16 @@ import {
   writeFileInTree,
   ZERO_OID,
 } from './forge.ts';
+import {
+  ActionError,
+  addCommentAction,
+  createIssueAction,
+  createPullAction,
+  mergePullAction,
+  pullConflict,
+  pullFiles as pullChanges,
+  setIssueStateAction,
+} from './actions.ts';
 import { readJson, sendEmpty, sendJson } from './http.ts';
 
 /** The scopes the API root reports. */
@@ -158,41 +168,10 @@ export function pullView(repo, pull) {
 
 // ---------------------------------------------------------------- pull request arithmetic
 
-/** The trees a pull request's two sides hold, or nulls when a ref is gone. */
-function pullTrees(repo, pull) {
-  const baseOid = resolveRevision(repo, pull.base);
-  const headOid = resolveRevision(repo, pull.head);
-  if (baseOid === null || headOid === null) return null;
-  const baseTree = commitTree(repo, baseOid);
-  const headTree = commitTree(repo, headOid);
-  const base = mergeBase(repo, baseOid, headOid);
-  const baseCommonTree = base === null ? null : commitTree(repo, base);
-  return { baseOid, headOid, baseTree, headTree, commonTree: baseCommonTree };
-}
-
-/** Whether the two sides changed the same path to different content since their common ancestor. */
-export function pullConflict(repo, pull) {
-  if (pull.merged) return false;
-  const trees = pullTrees(repo, pull);
-  if (trees === null) return false;
-  const baseChanges = diffTrees(repo, trees.commonTree, trees.baseTree);
-  const headChanges = diffTrees(repo, trees.commonTree, trees.headTree);
-  const baseOids = new Map(baseChanges.map((change) => [change.path, change.headOid]));
-  for (const change of headChanges) {
-    const other = baseOids.get(change.path);
-    if (other !== undefined && other !== change.headOid) return true;
-    if (other !== undefined && change.headOid === null) return true;
-  }
-  return false;
-}
-
 /** A pull request's changed files, as the files route reports them. */
 export function pullFiles(repo, pull) {
-  const trees = pullTrees(repo, pull);
-  if (trees === null) return [];
-  const changes = diffTrees(repo, trees.commonTree, trees.headTree);
-  return changes.map((change) => ({
-    sha: change.headOid ?? change.baseOid,
+  return pullChanges(repo, pull).map((change) => ({
+    sha: change.sha,
     filename: change.path,
     status: change.status,
     additions: change.additions,
@@ -202,37 +181,6 @@ export function pullFiles(repo, pull) {
     raw_url: `/api/v3/repos/${repo.fullName}/raw/${pull.head}/${change.path}`,
     contents_url: `/api/v3/repos/${repo.fullName}/contents/${change.path}?ref=${pull.head}`,
   }));
-}
-
-/**
- * Merge a pull request: `squash` writes one commit on the base branch carrying the head's changes,
- * the other methods write the same squash commit (the checks ask for squash, and one shape answers
- * all three without a merge-commit walk).
- */
-function mergePullRequest(forge, repo, pull, method) {
-  const trees = pullTrees(repo, pull);
-  if (trees === null) return null;
-  let tree = trees.baseTree;
-  for (const change of diffTrees(repo, trees.commonTree, trees.headTree)) {
-    tree = writeFileInTree(repo, tree, change.path, change.headOid === null ? null : { mode: '100644', oid: change.headOid });
-  }
-  if (tree === null) return null;
-  const timestamp = Math.floor(Date.parse(pull.createdAt) / 1000) + 60;
-  const sha = writeCommit(repo, {
-    tree,
-    parents: [trees.baseOid],
-    message: `${pull.title} (#${pull.number})\n\n${method === 'squash' ? 'squashed' : 'merged'}\n`,
-    author: `${repo.owner} <${repo.owner}@example.invalid>`,
-    timestamp,
-  });
-  repo.refs.set(`refs/heads/${pull.base}`, sha);
-  repo.ancestorCache.clear();
-  pull.merged = true;
-  pull.state = 'closed';
-  pull.mergedAt = new Date(timestamp * 1000).toISOString();
-  pull.mergeCommitSha = sha;
-  pull.updatedAt = pull.mergedAt;
-  return sha;
 }
 
 // ---------------------------------------------------------------- request helpers
@@ -340,7 +288,6 @@ function commitPath(forge, repo, { branch, path, blobOid, message }) {
     timestamp,
   });
   repo.refs.set(refName, commitOid);
-  repo.ancestorCache.clear();
   return commitOid;
 }
 
@@ -707,34 +654,14 @@ export async function handleRest(forge, req, res, segments, query) {
           return;
         }
         const body = objectBody(read.value) ?? {};
-        const title = typeof body.title === 'string' ? body.title : '';
-        if (title === '') {
-          apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'Issue', code: 'missing_field', field: 'title' }] });
+        let issue;
+        try {
+          issue = createIssueAction(forge, repo, body);
+        } catch (error) {
+          if (!(error instanceof ActionError)) throw error;
+          apiError(res, error.status, 'Validation Failed', { errors: [{ resource: 'Issue', code: 'invalid', field: 'title', message: error.message }] });
           return;
         }
-        const names = Array.isArray(body.labels) ? body.labels.filter((name) => typeof name === 'string') : [];
-        const unknown = names.filter((name) => !repo.labels.has(name));
-        if (unknown.length > 0) {
-          apiError(res, 422, 'Validation Failed', { errors: unknown.map((name) => ({ resource: 'Label', code: 'invalid', field: 'labels', message: `label ${name} does not exist` })) });
-          return;
-        }
-        repo.issueCounter += 1;
-        const now = forge.tick();
-        const issue = {
-          id: forge.nextIssueId++,
-          number: repo.issueCounter,
-          title,
-          body: typeof body.body === 'string' ? body.body : '',
-          state: 'open',
-          labels: names,
-          author: repo.owner,
-          createdAt: now,
-          updatedAt: now,
-          closedAt: null,
-          comments: 0,
-          labelObjects: null,
-        };
-        repo.issues.push(issue);
         sendJson(res, 201, issueView(repo, issue), { location: `/api/v3/repos/${repo.fullName}/issues/${issue.number}` });
         return;
       }
@@ -762,8 +689,7 @@ export async function handleRest(forge, req, res, segments, query) {
         if (typeof body.title === 'string' && body.title !== '') issue.title = body.title;
         if (typeof body.body === 'string') issue.body = body.body;
         if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) {
-          issue.state = body.state;
-          issue.closedAt = body.state === 'closed' ? forge.tick() : null;
+          setIssueStateAction(forge, repo, issue, body.state);
         }
         if (Array.isArray(body.labels)) {
           const names = body.labels.filter((name) => typeof name === 'string');
@@ -796,14 +722,14 @@ export async function handleRest(forge, req, res, segments, query) {
             return;
           }
           const body = objectBody(read.value) ?? {};
-          if (typeof body.body !== 'string' || body.body === '') {
-            apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'IssueComment', code: 'missing_field', field: 'body' }] });
+          let comment;
+          try {
+            comment = addCommentAction(forge, repo, issue, body.body);
+          } catch (error) {
+            if (!(error instanceof ActionError)) throw error;
+            apiError(res, error.status, 'Validation Failed', { errors: [{ resource: 'IssueComment', code: 'missing_field', field: 'body' }] });
             return;
           }
-          const comment = { id: forge.nextCommentId++, body: body.body, author: repo.owner, createdAt: forge.tick() };
-          comments.push(comment);
-          repo.comments.set(issue.number, comments);
-          issue.comments = comments.length;
           sendJson(res, 201, commentView(repo, issue, comment), { location: `/api/v3/repos/${repo.fullName}/issues/comments/${comment.id}` });
           return;
         }
@@ -827,49 +753,14 @@ export async function handleRest(forge, req, res, segments, query) {
           return;
         }
         const body = objectBody(read.value) ?? {};
-        const title = typeof body.title === 'string' ? body.title : '';
-        let head = typeof body.head === 'string' ? body.head : '';
-        const base = typeof body.base === 'string' && body.base !== '' ? body.base : repo.defaultBranch;
-        if (head.includes(':')) head = head.slice(head.indexOf(':') + 1);
-        if (title === '' || head === '') {
-          apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'PullRequest', code: 'missing_field', field: title === '' ? 'title' : 'head' }] });
+        let pull;
+        try {
+          pull = createPullAction(forge, repo, body);
+        } catch (error) {
+          if (!(error instanceof ActionError)) throw error;
+          apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'PullRequest', code: 'invalid', field: 'head', message: error.message }] });
           return;
         }
-        const headOid = refTip(repo, `refs/heads/${head}`) ?? (head.match(/^[0-9a-f]{40}$/) ? head : null);
-        const baseOid = refTip(repo, `refs/heads/${base}`);
-        if (headOid === null) {
-          apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'PullRequest', code: 'invalid', field: 'head', message: `No commits between ${base} and ${head}` }] });
-          return;
-        }
-        if (baseOid === null) {
-          apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'PullRequest', code: 'invalid', field: 'base', message: `base ${base} does not exist` }] });
-          return;
-        }
-        const existing = repo.pulls.find((pull) => pull.head === head && pull.base === base && pull.state === 'open' && !pull.merged);
-        if (existing !== undefined) {
-          apiError(res, 422, 'Validation Failed', { errors: [{ resource: 'PullRequest', code: 'custom', message: `A pull request already exists for ${head}.` }] });
-          return;
-        }
-        repo.pullCounter += 1;
-        const now = forge.tick();
-        const pull = {
-          id: forge.nextPullId++,
-          number: repo.pullCounter,
-          title,
-          body: typeof body.body === 'string' ? body.body : '',
-          state: 'open',
-          head,
-          base,
-          headSha: headOid,
-          baseSha: baseOid,
-          merged: false,
-          mergedAt: null,
-          mergeCommitSha: null,
-          author: repo.owner,
-          createdAt: now,
-          updatedAt: now,
-        };
-        repo.pulls.push(pull);
         sendJson(res, 201, pullView(repo, pull), { location: `/api/v3/repos/${repo.fullName}/pulls/${pull.number}` });
         return;
       }
@@ -900,17 +791,12 @@ export async function handleRest(forge, req, res, segments, query) {
         const read = await readJson(req);
         const body = read.ok ? (objectBody(read.value) ?? {}) : {};
         const mergeMethod = typeof body.merge_method === 'string' ? body.merge_method : 'merge';
-        if (pull.merged) {
-          apiError(res, 405, 'Pull Request is not mergeable', { errors: [{ message: 'Pull Request is not mergeable' }] });
-          return;
-        }
-        if (pullConflict(repo, pull)) {
-          apiError(res, 405, 'Pull Request is not mergeable', { errors: [{ message: 'Pull Request is not mergeable' }] });
-          return;
-        }
-        const sha = mergePullRequest(forge, repo, pull, mergeMethod);
-        if (sha === null) {
-          apiError(res, 405, 'Pull Request is not mergeable', { errors: [{ message: 'Pull Request is not mergeable' }] });
+        let sha;
+        try {
+          sha = mergePullAction(forge, repo, pull, mergeMethod);
+        } catch (error) {
+          if (!(error instanceof ActionError)) throw error;
+          apiError(res, error.status, 'Pull Request is not mergeable', { errors: [{ message: 'Pull Request is not mergeable' }] });
           return;
         }
         sendJson(res, 200, { sha, merged: true, message: 'Pull Request successfully merged' });
