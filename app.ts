@@ -1,49 +1,117 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// @ts-nocheck — the runtime strips types; there is no type-checking step in the trial pod.
+// The forge's server: one process, one listener, four surfaces.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+//   /healthz                                  the env's boot probe
+//   /{owner}/{repo}.git/...                   git smart HTTP (githttp.ts)
+//   /api/v3/...                               GitHub REST v3 (rest.ts)
+//   /api/graphql                              GitHub GraphQL v4 (graphql.ts)
+//   /mcp                                      Model Context Protocol (mcp.ts)
+//
+// Every API call presents the trial's bearer token; a request without it is 401. A repository
+// belongs to the login the token names, so the same name under another owner is a 404.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
+import { Forge } from './forge.ts';
+import { handleGit } from './githttp.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { handleRest } from './rest.ts';
+import { bearerOf, messageOf, segmentsOf, sendJson } from './http.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+/**
+ * Whether the request carries the trial's token. The suite presents it as a bearer token; a real git
+ * client sends it as the password of Basic auth (`http://user:token@host/...`), so both are taken.
+ * An unset token accepts anything a client presents (a hand-run server).
+ */
+function authorized(req, token) {
+  const header = req.headers.authorization;
+  if (typeof header !== 'string') return false;
+  const text = header.trim();
+  let presented = null;
+  const bearer = /^Bearer\s+(.+)$/i.exec(text);
+  if (bearer !== null) presented = bearer[1].trim();
+  else {
+    const basic = /^Basic\s+(.+)$/i.exec(text);
+    if (basic !== null) {
+      const decoded = Buffer.from(basic[1].trim(), 'base64').toString('utf8');
+      const colon = decoded.indexOf(':');
+      presented = colon < 0 ? decoded : decoded.slice(colon + 1);
+    }
   }
+  if (presented === null) return false;
+  if (token === '') return presented !== '';
+  return presented === token;
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
+async function dispatch(forge, token, req, res) {
+  const parsed = segmentsOf(req.url ?? '/');
+  if (parsed === null) {
     sendJson(res, 404, { message: 'Not Found' });
+    return;
+  }
+  const { path, query, segments } = parsed;
+  const method = req.method ?? 'GET';
+
+  if (path === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (path === '/mcp' || path === '/mcp/') {
+    await handleMcp(forge, req, res, token);
+    return;
+  }
+
+  if (path === '/api/graphql' || path === '/api/graphql/') {
+    if (method !== 'POST') {
+      sendJson(res, 405, { message: 'POST /api/graphql takes a JSON body' });
+      return;
+    }
+    if (!authorized(req, token)) {
+      sendJson(res, 401, { message: 'Requires authentication' });
+      return;
+    }
+    await handleGraphQL(forge, req, res);
+    return;
+  }
+
+  if (segments[0] === 'api' && segments[1] === 'v3') {
+    if (!authorized(req, token)) {
+      sendJson(res, 401, { message: 'Requires authentication', documentation_url: 'https://docs.github.com/rest' });
+      return;
+    }
+    await handleRest(forge, req, res, segments.slice(2), query);
+    return;
+  }
+
+  if (segments.length >= 2 && segments[1].endsWith('.git')) {
+    if (!authorized(req, token)) {
+      // A real git client only sends the credentials in its URL after a Basic challenge.
+      sendJson(res, 401, { message: 'Requires authentication' }, { 'www-authenticate': 'Basic realm="makefun-forge"' });
+      return;
+    }
+    if (await handleGit(forge, req, res, segments, query)) return;
+  }
+
+  sendJson(res, 404, { message: 'Not Found' });
+}
+
+/** Build the server. It binds nothing until the entry listens on its ephemeral port. */
+export function createApp() {
+  const forge = new Forge();
+  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const server = createServer((req, res) => {
+    dispatch(forge, token, req, res).catch((error) => {
+      process.stderr.write(`[forge] ${req.method} ${req.url} failed: ${messageOf(error)}\n`);
+      try {
+        sendJson(res, 500, { message: 'the forge failed to answer this request' });
+      } catch {
+        // The response was already written.
+      }
+    });
   });
+  // The benchmark reads 2,000 issues over one keep-alive connection: keep it alive generously.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
+  return server;
 }
