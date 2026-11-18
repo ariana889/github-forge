@@ -22,6 +22,17 @@ const CODE_TYPE = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const FLUSH = Buffer.from('0000', 'ascii');
 const DELIM = Buffer.from('0001', 'ascii');
 const RESPONSE_END = Buffer.from('0002', 'ascii');
+const EMPTY = Buffer.alloc(0);
+/** The hex digits of a pkt-line length, written without a string allocation. */
+const HEX = Buffer.from('0123456789abcdef', 'ascii');
+
+/** Write the four hex digits of `value` at `offset` of `out`. */
+function writeLength(out, offset, value) {
+  out[offset] = HEX[(value >> 12) & 15];
+  out[offset + 1] = HEX[(value >> 8) & 15];
+  out[offset + 2] = HEX[(value >> 4) & 15];
+  out[offset + 3] = HEX[value & 15];
+}
 
 /** A 40-hex object id. */
 export function isObjectId(value) {
@@ -47,9 +58,10 @@ export function hashObject(type, data) {
 export function pktLine(payload) {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   if (data.length > PKT_LINE_MAX_PAYLOAD) throw new Error(`pkt-line payload is ${data.length} bytes`);
-  const head = Buffer.allocUnsafe(4);
-  head.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([head, data]);
+  const out = Buffer.allocUnsafe(data.length + 4);
+  writeLength(out, 0, data.length + 4);
+  data.copy(out, 4);
+  return out;
 }
 
 /** A flush packet. */
@@ -60,13 +72,41 @@ export function pktFlush() {
 /** Frame a list of payloads; the strings 'flush', 'delim' and 'response-end' are control packets. */
 export function encodePktLines(items) {
   const parts = [];
+  let total = 0;
   for (const item of items) {
-    if (item === 'flush' || item === null || item === undefined) parts.push(FLUSH);
-    else if (item === 'delim') parts.push(DELIM);
-    else if (item === 'response-end') parts.push(RESPONSE_END);
-    else parts.push(pktLine(item));
+    if (item === 'flush' || item === null || item === undefined) {
+      parts.push(FLUSH);
+      total += 4;
+      continue;
+    }
+    if (item === 'delim') {
+      parts.push(DELIM);
+      total += 4;
+      continue;
+    }
+    if (item === 'response-end') {
+      parts.push(RESPONSE_END);
+      total += 4;
+      continue;
+    }
+    const data = typeof item === 'string' ? Buffer.from(item, 'utf8') : item;
+    if (data.length > PKT_LINE_MAX_PAYLOAD) throw new Error(`pkt-line payload is ${data.length} bytes`);
+    parts.push(data);
+    total += data.length + 4;
   }
-  return Buffer.concat(parts);
+  const out = Buffer.allocUnsafe(total);
+  let offset = 0;
+  for (const part of parts) {
+    if (part === FLUSH || part === DELIM || part === RESPONSE_END) {
+      part.copy(out, offset);
+      offset += 4;
+      continue;
+    }
+    writeLength(out, offset, part.length + 4);
+    part.copy(out, offset + 4);
+    offset += part.length + 4;
+  }
+  return out;
 }
 
 /**
@@ -115,14 +155,28 @@ export function sideband(band, payload) {
   return pktLine(Buffer.concat([Buffer.from([band]), data]));
 }
 
-/** Frame `payload` as band-1 packets no larger than the pkt-line limit, in order. */
-export function sidebandFrames(band, payload) {
-  const frames = [];
-  const limit = PKT_LINE_MAX_PAYLOAD - 1;
-  for (let offset = 0; offset < payload.length; offset += limit) {
-    frames.push(sideband(band, payload.subarray(offset, Math.min(payload.length, offset + limit))));
+/**
+ * Frame `payload` as band packets of at most `limit` payload bytes each, then, when `flush` is
+ * set, a flush packet. One allocation for the whole stream, which is what a fetch or a push's
+ * report is written from.
+ */
+export function sidebandStream(band, payload, limit = PKT_LINE_MAX_PAYLOAD - 1, flush = false) {
+  const count = Math.ceil(payload.length / limit);
+  const size = payload.length + count * 5 + (flush ? 4 : 0);
+  if (size === 0) return EMPTY;
+  const out = Buffer.allocUnsafe(size);
+  let offset = 0;
+  let written = 0;
+  while (offset < payload.length) {
+    const chunk = Math.min(payload.length - offset, limit);
+    writeLength(out, written, chunk + 5);
+    out[written + 4] = band;
+    payload.copy(out, written + 5, offset, offset + chunk);
+    written += chunk + 5;
+    offset += chunk;
   }
-  return frames;
+  if (flush) FLUSH.copy(out, written);
+  return out;
 }
 
 // ---------------------------------------------------------------- object bodies

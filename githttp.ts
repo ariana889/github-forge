@@ -22,7 +22,7 @@ import {
   pktFlush,
   pktLine,
   readPack,
-  sidebandFrames,
+  sidebandStream,
   writePack,
 } from './gitproto.ts';
 import {
@@ -32,6 +32,7 @@ import {
   isAncestor,
   peel,
   putObject,
+  putObjectKnown,
   refTip,
   resolveRevision,
   treeEntries,
@@ -320,7 +321,7 @@ function fetchResponse(repo, plan) {
   }
   const pack = packFor(repo, plan.objects);
   parts.push(encodePktLines(['packfile\n']));
-  parts.push(Buffer.concat(sidebandFrames(1, pack)));
+  parts.push(sidebandStream(1, pack));
   parts.push(pktFlush());
   plan.response = Buffer.concat(parts);
   return plan.response;
@@ -418,7 +419,7 @@ function fetchV0(repo, body, res) {
   for (const oid of computed.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   parts.push(pktLine('NAK\n'));
   const pack = packFor(repo, computed.objects);
-  parts.push(Buffer.concat(sidebandFrames(1, pack)));
+  parts.push(sidebandStream(1, pack));
   parts.push(pktFlush());
   sendBytes(res, 200, UPLOAD_RESULT, Buffer.concat(parts));
 }
@@ -516,7 +517,7 @@ function receivePack(repo, body, res) {
   if (packBytes.length > 0) {
     try {
       const read = readPack(packBytes, (oid) => repo.objects.get(oid) ?? null);
-      for (const object of read.objects) putObject(repo, object.type, object.data);
+      for (const object of read.objects) putObjectKnown(repo, object.oid, object.type, object.data);
     } catch (error) {
       unpackDetail = `error ${String(error.message).replace(/\s+/g, ' ').slice(0, 200)}`;
     }
@@ -524,12 +525,7 @@ function receivePack(repo, body, res) {
   const results = unpackDetail === 'ok' ? applyCommands(repo, commands) : commands.map((command) => ({ ref: command.ref, ok: false, reason: 'unpacker error' }));
   const inner = reportStream(results, unpackDetail);
   if (capabilities.includes('side-band-64k')) {
-    const frames = [];
-    const limit = 65000;
-    for (let offset = 0; offset < inner.length; offset += limit) {
-      frames.push(Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), inner.subarray(offset, Math.min(inner.length, offset + limit))]))]));
-    }
-    sendBytes(res, 200, RECEIVE_RESULT, Buffer.concat([...frames, pktFlush()]));
+    sendBytes(res, 200, RECEIVE_RESULT, sidebandStream(1, inner, 65000, true));
     return;
   }
   sendBytes(res, 200, RECEIVE_RESULT, inner);

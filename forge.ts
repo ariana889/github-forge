@@ -107,6 +107,12 @@ export function putObject(repo, type, data) {
   return oid;
 }
 
+/** Store one object whose id the caller already computed (a pack's own hash); answers the id. */
+export function putObjectKnown(repo, oid, type, data) {
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  return oid;
+}
+
 /** The object with id `oid`, or null. */
 export function getObject(repo, oid) {
   return repo.objects.get(oid) ?? null;

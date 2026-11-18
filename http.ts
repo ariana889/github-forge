@@ -17,13 +17,14 @@ export function nextRequestId() {
 /** Answer with a JSON body; `headers` go beside the JSON and cache ones. */
 export function sendJson(res, status, body, headers) {
   const text = typeof body === 'string' ? body : `${JSON.stringify(body)}\n`;
-  const base = {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': nextRequestId(),
-  };
   try {
-    res.writeHead(status, { ...base, ...(headers ?? {}) });
+    const head = {
+      'content-type': JSON_TYPE,
+      'content-length': Buffer.byteLength(text),
+      'x-github-request-id': nextRequestId(),
+    };
+    if (headers !== undefined) for (const name in headers) head[name] = headers[name];
+    res.writeHead(status, head);
     res.end(text);
   } catch {
     // The peer went away; there is nobody left to answer.
@@ -33,14 +34,15 @@ export function sendJson(res, status, body, headers) {
 /** Answer with raw bytes and an explicit content type (the git smart-HTTP services). */
 export function sendBytes(res, status, contentType, body, headers) {
   try {
-    res.writeHead(status, {
+    const head = {
       'content-type': contentType,
       'content-length': body.length,
       'cache-control': 'no-cache, max-age=0, must-revalidate',
       pragma: 'no-cache',
       expires: 'Fri, 01 Jan 1980 00:00:00 GMT',
-      ...(headers ?? {}),
-    });
+    };
+    if (headers !== undefined) for (const name in headers) head[name] = headers[name];
+    res.writeHead(status, head);
     res.end(body);
   } catch {
     // The peer went away between the request and the answer.
@@ -57,17 +59,57 @@ export function sendEmpty(res, status, headers) {
   }
 }
 
-/** Read a whole request body; null when it is past `limit` bytes. */
+/** The empty body every reader shares. */
+const EMPTY_BODY = Buffer.alloc(0);
+
+/**
+ * Read a whole request body; null when it is past `limit` bytes. The usual case is one buffered
+ * chunk, which is answered without an array, a concat or an async iterator; the socket is dropped
+ * when the body is over the limit, as an unread body would otherwise poison the keep-alive socket.
+ */
 export async function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    size += buffer.length;
-    if (size > limit) return null;
-    chunks.push(buffer);
+  const first = req.read();
+  if (first !== null) {
+    if (first.length > limit) {
+      req.destroy();
+      return null;
+    }
+    const rest = await restOf(req, limit - first.length);
+    if (rest === null) return null;
+    return rest.length === 0 ? first : Buffer.concat([first, rest]);
   }
-  return Buffer.concat(chunks);
+  return restOf(req, limit);
+}
+
+/** The bytes after the first chunk, or null when the total passes `remaining`. */
+function restOf(req: IncomingMessage, remaining: number): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let over = false;
+    const onData = (chunk: Buffer): void => {
+      if (over) return;
+      size += chunk.length;
+      if (size > remaining) {
+        over = true;
+        chunks.length = 0;
+        req.destroy();
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => {
+      if (over) {
+        resolve(null);
+        return;
+      }
+      resolve(chunks.length === 0 ? EMPTY_BODY : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks));
+    };
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', () => resolve(null));
+  });
 }
 
 /** Read a JSON body: {ok: true, value} or {ok: false} when it is absent or not JSON. */
