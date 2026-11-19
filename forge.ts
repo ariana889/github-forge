@@ -124,17 +124,22 @@ export function getBlob(repo, oid) {
   return object !== undefined && object.type === 'blob' ? object.data : null;
 }
 
-/** A commit's parsed view, or null when the object is absent or not a commit. */
+/**
+ * A commit's parsed view, or null when the object is absent or not a commit. An object's bytes
+ * never change once stored, and neither does their parse: the first reader parses, every later
+ * reader gets the same structure back.
+ */
 export function getCommit(repo, oid) {
   const object = repo.objects.get(oid);
-  return object !== undefined && object.type === 'commit' ? parseCommit(object.data) : null;
+  if (object === undefined || object.type !== 'commit') return null;
+  return object.commit ?? (object.commit = parseCommit(object.data));
 }
 
-/** The tree entries of a tree object. */
+/** The tree entries of a tree object, in stored order (parsed once, like getCommit). */
 export function treeEntries(repo, treeOid) {
   const object = repo.objects.get(treeOid);
   if (object === undefined || object.type !== 'tree') return [];
-  return parseTree(object.data);
+  return object.entries ?? (object.entries = parseTree(object.data));
 }
 
 // ---------------------------------------------------------------- refs
