@@ -120,6 +120,30 @@ export function issueView(repo, issue) {
   };
 }
 
+/**
+ * One issue's reply body, memoised: the read workload asks for the same issue 2,000 times, and the
+ * bytes cannot have moved unless one of the fields the view shows moved. The stamp is those fields
+ * (the label colours included, since a label's colour is the repository's), so a write of any kind
+ * lands on a different stamp and rebuilds. Issues are mutated in place, never replaced, so the
+ * issue itself is the key.
+ */
+const issueBodyCache = new WeakMap();
+
+function issueStamp(repo, issue) {
+  const labels = issue.labels.length === 0 ? '' : issue.labels.map((name) => `${name}:${repo.labels.get(name) ?? ''}`).join(',');
+  return `${repo.owner}/${repo.name}\u0000${issue.state}\u0000${issue.title}\u0000${issue.body}\u0000${labels}\u0000${issue.comments}\u0000${issue.updatedAt}\u0000${issue.closedAt}`;
+}
+
+/** The serialised reply body of one issue, as the bytes the response writes. */
+export function issueBody(repo, issue) {
+  const stamp = issueStamp(repo, issue);
+  const cached = issueBodyCache.get(issue);
+  if (cached !== undefined && cached.stamp === stamp) return cached.bytes;
+  const bytes = Buffer.from(`${JSON.stringify(issueView(repo, issue))}\n`, 'utf8');
+  issueBodyCache.set(issue, { stamp, bytes });
+  return bytes;
+}
+
 /** A comment as REST shows it. */
 export function commentView(repo, issue, comment) {
   return {
@@ -671,7 +695,7 @@ export async function handleRest(forge, req, res, segments, query) {
           apiError(res, 404, 'Not Found');
           return;
         }
-        sendJson(res, 200, issueView(repo, issue));
+        sendJson(res, 200, issueBody(repo, issue));
         return;
       }
       if (rest.length === 2 && method === 'PATCH') {
@@ -701,7 +725,7 @@ export async function handleRest(forge, req, res, segments, query) {
           issue.labels = names;
         }
         issue.updatedAt = forge.tick();
-        sendJson(res, 200, issueView(repo, issue));
+        sendJson(res, 200, issueBody(repo, issue));
         return;
       }
       if (rest.length === 3 && rest[2] === 'comments') {

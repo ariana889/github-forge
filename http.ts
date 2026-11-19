@@ -14,18 +14,21 @@ export function nextRequestId() {
   return `makefun-forge-${requestCounter}`;
 }
 
-/** Answer with a JSON body; `headers` go beside the JSON and cache ones. */
+/** Answer with a JSON body; `headers` go beside the JSON and cache ones. A Buffer body is already
+ *  the exact reply bytes (a cached, serialised body): it is written as-is, with no second encode. */
 export function sendJson(res, status, body, headers) {
-  const text = typeof body === 'string' ? body : `${JSON.stringify(body)}\n`;
+  const bytes = Buffer.isBuffer(body)
+    ? body
+    : Buffer.from(typeof body === 'string' ? body : `${JSON.stringify(body)}\n`, 'utf8');
   try {
     const head = {
       'content-type': JSON_TYPE,
-      'content-length': Buffer.byteLength(text),
+      'content-length': bytes.length,
       'x-github-request-id': nextRequestId(),
     };
     if (headers !== undefined) for (const name in headers) head[name] = headers[name];
     res.writeHead(status, head);
-    res.end(text);
+    res.end(bytes);
   } catch {
     // The peer went away; there is nobody left to answer.
   }
